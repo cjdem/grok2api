@@ -5,7 +5,7 @@ import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -466,6 +466,75 @@ async def get_cache_size(_: bool = Depends(verify_admin_session)) -> Dict[str, A
     except Exception as e:
         logger.error(f"[Admin] 获取缓存大小异常: {e}")
         raise HTTPException(status_code=500, detail={"error": f"获取失败: {e}", "code": "CACHE_SIZE_ERROR"})
+
+
+@router.get("/api/cache/list")
+async def list_cache_files(
+    cache_type: str = Query("image", alias="type"),
+    limit: int = 50,
+    offset: int = 0,
+    _: bool = Depends(verify_admin_session)
+) -> Dict[str, Any]:
+    """List cached files for admin preview."""
+    try:
+        cache_type = cache_type.lower()
+        if cache_type not in ("image", "video"):
+            raise HTTPException(status_code=400, detail={"error": "Invalid cache type", "code": "INVALID_CACHE_TYPE"})
+
+        if limit < 1:
+            limit = 1
+        if limit > 200:
+            limit = 200
+        if offset < 0:
+            offset = 0
+
+        cache_dir = IMAGE_CACHE_DIR if cache_type == "image" else VIDEO_CACHE_DIR
+        if not cache_dir.exists():
+            return {"success": True, "data": {"total": 0, "items": [], "offset": offset, "limit": limit, "has_more": False}}
+
+        files = []
+        for file_path in cache_dir.iterdir():
+            if not file_path.is_file():
+                continue
+            try:
+                stat = file_path.stat()
+            except Exception as e:
+                logger.warning(f"[Admin] Skip cache file: {file_path.name}, {e}")
+                continue
+            files.append((file_path, stat.st_mtime, stat.st_size))
+
+        files.sort(key=lambda item: item[1], reverse=True)
+        total = len(files)
+        sliced = files[offset:offset + limit]
+
+        items = [
+            {
+                "name": file_path.name,
+                "size": _format_size(size),
+                "size_bytes": size,
+                "mtime": int(mtime * 1000),
+                "url": f"/images/{file_path.name}",
+                "type": cache_type
+            }
+            for file_path, mtime, size in sliced
+        ]
+
+        return {
+            "success": True,
+            "data": {
+                "total": total,
+                "items": items,
+                "offset": offset,
+                "limit": limit,
+                "has_more": offset + limit < total
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[Admin] 获取缓存列表异常: {e}")
+        raise HTTPException(status_code=500, detail={"error": f"获取失败: {e}", "code": "CACHE_LIST_ERROR"})
 
 
 @router.post("/api/cache/clear")
