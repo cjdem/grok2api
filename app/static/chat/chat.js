@@ -59,6 +59,8 @@ function detectBase64ImageMime(base64Text) {
 function toImageDataUrl(raw) {
   const value = String(raw || '').trim();
   if (!value) return '';
+  const lowered = value.toLowerCase();
+  if (['error', 'null', 'none', 'undefined'].includes(lowered)) return '';
   if (value.startsWith('data:image/')) return value;
   const mime = detectBase64ImageMime(value);
   return `data:${mime};base64,${value}`;
@@ -66,7 +68,15 @@ function toImageDataUrl(raw) {
 
 function pickImageSrc(item) {
   const rawUrl = String(item?.url || '').trim();
-  if (rawUrl && rawUrl !== 'https://assets.grok.com/' && rawUrl !== 'https://assets.grok.com') {
+  const rawUrlLower = rawUrl.toLowerCase();
+  if (
+    rawUrl &&
+    rawUrl !== 'https://assets.grok.com/' &&
+    rawUrl !== 'https://assets.grok.com' &&
+    rawUrlLower !== 'error' &&
+    rawUrlLower !== 'null' &&
+    rawUrlLower !== 'undefined'
+  ) {
     return toAbsoluteUrl(rawUrl);
   }
   const b64json = String(item?.b64_json || '').trim();
@@ -635,6 +645,7 @@ async function generateImage() {
   const model = String(q('model-select').value || 'grok-imagine-1.0').trim();
   const n = Math.max(1, Math.min(10, Math.floor(Number(q('image-n').value || 1) || 1)));
   const stream = Boolean(q('stream-toggle').checked);
+  const useStream = stream && n <= 2;
   const { size, concurrency } = buildImageRequestConfig();
 
   const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
@@ -645,7 +656,11 @@ async function generateImage() {
 
   const reqBody = { prompt, model, n, size, concurrency };
   try {
-    if (stream) {
+    if (stream && !useStream) {
+      showToast('n > 2 automatically disables Stream and falls back to non-stream mode.', 'warning');
+    }
+
+    if (useStream) {
       const rendered = await streamImage(reqBody, headers);
       if (!rendered) throw new Error('没有生成结果');
       return;
