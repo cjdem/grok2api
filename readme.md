@@ -20,6 +20,7 @@
 - 部署与配置说明：`README.cloudflare.md`
 - 一键部署工作流：`.github/workflows/cloudflare-workers.yml`
   - 一键部署前置条件：仓库需配置 `CLOUDFLARE_API_TOKEN` 与 `CLOUDFLARE_ACCOUNT_ID`。
+- Workers/Pages 版本支持原生会话续聊（`conversation_id` / `X-Conversation-ID`）与会话过期清理（D1）。
 
 ## 使用说明
 
@@ -64,6 +65,20 @@ python scripts/smoke_test.py --base-url http://127.0.0.1:8000
 
 > 部署一致性说明：本地（FastAPI）/ Docker / Cloudflare Workers 共用同一套管理功能语义（Token 筛选、API Key 管理、后台管理接口语义一致）。
 > Cloudflare 可通过 `.github/workflows/cloudflare-workers.yml` 一键部署（需先配置上述两个 Secrets），Docker 仍保持 `docker compose up -d` 一键启动。
+
+### Cloudflare 旧版本一键升级（保留原数据）
+
+如果你已经在 Cloudflare 部署过旧版本，升级到当前版本可直接复用原 Worker / D1 / KV：
+
+1. 保持 `wrangler.toml` 的 `name` 与 `database_name` 不变（例如 `grok2api`）。
+2. 确保 GitHub Secrets 已配置：
+   - `CLOUDFLARE_API_TOKEN`
+   - `CLOUDFLARE_ACCOUNT_ID`
+3. 触发 `.github/workflows/cloudflare-workers.yml`（`push main` 或手动 `workflow_dispatch -> cloudflare`）。
+4. 工作流会自动执行 `wrangler d1 migrations apply DB --remote`，包括会话上下文迁移（`0006_conversations.sql`）。
+
+可选参数：
+- `CONVERSATION_CLEANUP_BATCH`：过期会话批量清理大小（默认 `200`）。
 
 ### 管理面板
 
@@ -207,6 +222,7 @@ curl http://localhost:8000/v1/chat/completions \
 | `model`            | string  | 模型名称                       | -                                                  |
 | `messages`         | array   | 消息列表                       | `developer`, `system`, `user`, `assistant` |
 | `stream`           | boolean | 是否开启流式输出               | `true`, `false`                                |
+| `conversation_id`  | string  | 会话 ID（可选）                | 推荐与响应头 `X-Conversation-ID` 配合使用       |
 | `thinking`         | string  | 思维链模式                     | `enabled`, `disabled`, `null`                |
 | `video_config`     | object  | **视频模型专用配置对象** | -                                                  |
 | └─`aspect_ratio` | string  | 视频宽高比                     | `16:9`, `9:16`, `1:1`, `2:3`, `3:2`      |

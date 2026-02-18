@@ -3,6 +3,7 @@
 let currentTab = 'chat';
 let models = [];
 let chatMessages = [];
+let chatConversationId = '';
 let chatAttachments = []; // { file, previewUrl }
 let videoAttachments = [];
 let imageGenerationMethod = 'legacy';
@@ -32,6 +33,19 @@ function getUserApiKey() {
 function buildApiHeaders() {
   const k = getUserApiKey();
   return k ? { Authorization: `Bearer ${k}` } : {};
+}
+
+function withConversationHeaders(headers, conversationId) {
+  const out = { ...headers };
+  const id = String(conversationId || '').trim();
+  if (id) out['X-Conversation-ID'] = id;
+  return out;
+}
+
+function pickConversationIdFromResponse(res, data) {
+  const fromHeader = String(res?.headers?.get?.('X-Conversation-ID') || '').trim();
+  if (fromHeader) return fromHeader;
+  return String(data?.conversation_id || '').trim();
 }
 
 function escapeHtml(s) {
@@ -228,6 +242,7 @@ async function init() {
   await refreshImageGenerationMethod();
 
   chatMessages = [];
+  chatConversationId = '';
   q('chat-messages').innerHTML = '';
   showUserMsg('system', '提示：选择模型后即可开始聊天；生图/视频请切换到对应 Tab。');
 }
@@ -749,6 +764,7 @@ function clearApiKey() {
   stopImageContinuous();
   localStorage.removeItem(STORAGE_KEY);
   q('api-key-input').value = '';
+  chatConversationId = '';
   imageGenerationMethod = 'legacy';
   imageGenerationExperimental = false;
   updateImageModeUI();
@@ -800,7 +816,10 @@ async function sendChat() {
   const model = String(q('model-select').value || '').trim();
   const stream = Boolean(q('stream-toggle').checked);
 
-  const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
+  const headers = withConversationHeaders(
+    { ...buildApiHeaders(), 'Content-Type': 'application/json' },
+    chatConversationId,
+  );
   if (!headers.Authorization) return showToast('请先填写 API Key', 'warning');
 
   try {
@@ -825,6 +844,7 @@ async function sendChat() {
     renderAttachments('chat');
 
     const body = { model, messages: chatMessages, stream };
+    if (chatConversationId) body.conversation_id = chatConversationId;
 
     if (stream) {
       const assistantBubble = showUserMsg('assistant', '');
@@ -833,6 +853,8 @@ async function sendChat() {
       const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
       if (res.status === 401) return showToast('API Key 无效或未授权', 'error');
       const data = await res.json();
+      const receivedConversationId = pickConversationIdFromResponse(res, data);
+      if (receivedConversationId) chatConversationId = receivedConversationId;
       const content = data?.choices?.[0]?.message?.content || '';
       chatMessages.push({ role: 'assistant', content });
       showUserMsg('assistant', content);
@@ -843,12 +865,17 @@ async function sendChat() {
 }
 
 async function streamChat(body, bubbleEl) {
-  const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
+  const headers = withConversationHeaders(
+    { ...buildApiHeaders(), 'Content-Type': 'application/json' },
+    chatConversationId,
+  );
   const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
   if (!res.ok || !res.body) {
     const t = await res.text().catch(() => '');
     throw new Error(`HTTP ${res.status}: ${t.slice(0, 200)}`);
   }
+  const receivedConversationId = pickConversationIdFromResponse(res, null);
+  if (receivedConversationId) chatConversationId = receivedConversationId;
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -1178,4 +1205,3 @@ if (document.readyState === 'loading') {
 } else {
   init();
 }
-

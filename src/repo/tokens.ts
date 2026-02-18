@@ -173,6 +173,29 @@ export async function selectBestToken(db: Env["DB"], model: string): Promise<{ t
   return (await pick("sso")) ?? (await pick("ssoSuper"));
 }
 
+export async function getAvailableTokenByValue(
+  db: Env["DB"],
+  token: string,
+  model: string,
+): Promise<{ token: string; token_type: TokenType } | null> {
+  const now = nowMs();
+  const isHeavy = model === "grok-4-heavy";
+  const field = isHeavy ? "heavy_remaining_queries" : "remaining_queries";
+  const row = await dbFirst<{ token: string; token_type: TokenType }>(
+    db,
+    `SELECT token, token_type FROM tokens
+     WHERE token = ?
+       AND status != 'expired'
+       AND failed_count < ?
+       AND (cooldown_until IS NULL OR cooldown_until <= ?)
+       AND ${field} != 0
+       ${isHeavy ? "AND token_type = 'ssoSuper'" : ""}
+     LIMIT 1`,
+    [token, MAX_FAILURES, now],
+  );
+  return row ? { token: row.token, token_type: row.token_type } : null;
+}
+
 export async function recordTokenFailure(
   db: Env["DB"],
   token: string,
@@ -180,7 +203,9 @@ export async function recordTokenFailure(
   message: string,
 ): Promise<void> {
   const now = nowMs();
-  const reason = `${status}: ${message}`;
+  const trimmed = String(message || "").trim();
+  const reason = `${status}: ${trimmed}`;
+  const lower = trimmed.toLowerCase();
   await dbRun(
     db,
     "UPDATE tokens SET failed_count = failed_count + 1, last_failure_time = ?, last_failure_reason = ? WHERE token = ?",
@@ -189,9 +214,23 @@ export async function recordTokenFailure(
 
   const row = await dbFirst<{ failed_count: number }>(db, "SELECT failed_count FROM tokens WHERE token = ?", [token]);
   if (!row) return;
-  if (status >= 400 && status < 500 && row.failed_count >= MAX_FAILURES) {
+  const authInvalid =
+    status === 401 ||
+    lower.includes("invalid token") ||
+    lower.includes("token invalid") ||
+    lower.includes("token expired") ||
+    lower.includes("authentication_error");
+  if (authInvalid && row.failed_count >= MAX_FAILURES) {
     await dbRun(db, "UPDATE tokens SET status = 'expired' WHERE token = ?", [token]);
   }
+}
+
+export async function recordTokenSuccess(db: Env["DB"], token: string): Promise<void> {
+  await dbRun(
+    db,
+    "UPDATE tokens SET failed_count = 0, cooldown_until = NULL, last_failure_time = NULL, last_failure_reason = NULL WHERE token = ? AND status != 'expired'",
+    [token],
+  );
 }
 
 export async function applyCooldown(db: Env["DB"], token: string, status: number): Promise<void> {

@@ -4,6 +4,7 @@ import { openAiRoutes } from "./routes/openai";
 import { mediaRoutes } from "./routes/media";
 import { adminRoutes } from "./routes/admin";
 import { runKvDailyClear } from "./kv/cleanup";
+import { cleanupExpiredConversations } from "./repo/conversations";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -30,6 +31,12 @@ function withResponseHeaders(res: Response, extra: Record<string, string>): Resp
   const headers = new Headers(res.headers);
   for (const [k, v] of Object.entries(extra)) headers.set(k, v);
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+function parseIntSafe(v: string | undefined, fallback: number): number {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.floor(n);
 }
 
 function assetFetchError(message: string, buildSha: string): Response {
@@ -205,6 +212,8 @@ const handler: ExportedHandler<Env> = {
   fetch: (request, env, ctx) => app.fetch(request, env, ctx),
   scheduled: (_event, env, ctx) => {
     ctx.waitUntil(runKvDailyClear(env));
+    const batch = Math.max(1, Math.min(1000, parseIntSafe(env.CONVERSATION_CLEANUP_BATCH, 200)));
+    ctx.waitUntil(cleanupExpiredConversations(env.DB, batch));
   },
 };
 

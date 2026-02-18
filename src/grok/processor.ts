@@ -1,6 +1,59 @@
 import type { GrokSettings, GlobalSettings } from "../settings";
 
 type GrokNdjson = Record<string, unknown>;
+type GrokObj = Record<string, unknown>;
+
+export interface GrokConversationMeta {
+  grokConversationId: string;
+  lastResponseId: string;
+}
+
+interface StreamFinishResult {
+  status: number;
+  duration: number;
+  meta: GrokConversationMeta;
+}
+
+function asObj(v: unknown): GrokObj | null {
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as GrokObj) : null;
+}
+
+function asStr(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
+
+function extractSearchQuery(raw: string): string {
+  const tool = raw.match(/<xai:tool_name>([\w-]+)<\/xai:tool_name>/i);
+  if (!tool || tool[1]?.toLowerCase() !== "web_search") return "";
+  const args = raw.match(/<!\[CDATA\[(.+?)\]\]>/is);
+  if (!args || !args[1]) return "";
+  try {
+    const parsed = JSON.parse(args[1]) as Record<string, unknown>;
+    return asStr(parsed.query);
+  } catch {
+    return "";
+  }
+}
+
+function extractMetaFromLine(data: GrokNdjson): Partial<GrokConversationMeta> {
+  const result = asObj((data as any).result);
+  if (!result) return {};
+
+  const conversation = asObj(result.conversation);
+  const response = asObj(result.response);
+  const userResponse = asObj(result.userResponse);
+  const modelResponse = asObj(result.modelResponse);
+  const responseModel = asObj(response?.modelResponse);
+
+  return {
+    grokConversationId: asStr(conversation?.conversationId),
+    lastResponseId:
+      asStr(response?.responseId) ||
+      asStr(responseModel?.responseId) ||
+      asStr(modelResponse?.responseId) ||
+      asStr(userResponse?.responseId),
+  };
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -121,7 +174,8 @@ export function createOpenAiStreamFromGrokNdjson(
     settings: GrokSettings;
     global: GlobalSettings;
     origin: string;
-    onFinish?: (result: { status: number; duration: number }) => Promise<void> | void;
+    onMeta?: (meta: GrokConversationMeta) => Promise<void> | void;
+    onFinish?: (result: StreamFinishResult) => Promise<void> | void;
   },
 ): ReadableStream<Uint8Array> {
   const { settings, global, origin } = opts;
@@ -136,6 +190,7 @@ export function createOpenAiStreamFromGrokNdjson(
     .map((t) => t.trim())
     .filter(Boolean);
   const showThinking = settings.show_thinking !== false;
+  const showSearch = settings.show_search === true;
 
   const firstTimeoutMs = Math.max(0, (settings.stream_first_response_timeout ?? 30) * 1000);
   const chunkTimeoutMs = Math.max(0, (settings.stream_chunk_timeout ?? 120) * 1000);
@@ -163,12 +218,28 @@ export function createOpenAiStreamFromGrokNdjson(
       let thinkingFinished = false;
       let videoProgressStarted = false;
       let lastVideoProgress = -1;
+      let lastSearchResultCount = -1;
+      const seenSearchQueries = new Set<string>();
+      const meta: GrokConversationMeta = { grokConversationId: "", lastResponseId: "" };
 
       let buffer = "";
 
       const flushStop = () => {
         controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
         controller.enqueue(encoder.encode(makeDone()));
+      };
+
+      const updateMeta = async (part: Partial<GrokConversationMeta>) => {
+        let changed = false;
+        if (part.grokConversationId && part.grokConversationId !== meta.grokConversationId) {
+          meta.grokConversationId = part.grokConversationId;
+          changed = true;
+        }
+        if (part.lastResponseId && part.lastResponseId !== meta.lastResponseId) {
+          meta.lastResponseId = part.lastResponseId;
+          changed = true;
+        }
+        if (changed && opts.onMeta) await opts.onMeta(meta);
       };
 
       try {
@@ -178,20 +249,26 @@ export function createOpenAiStreamFromGrokNdjson(
           const elapsed = now - startTime;
           if (!firstReceived && elapsed > firstTimeoutMs) {
             flushStop();
-            if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
+            if (opts.onFinish) {
+              await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000, meta });
+            }
             controller.close();
             return;
           }
           if (totalTimeoutMs > 0 && elapsed > totalTimeoutMs) {
             flushStop();
-            if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
+            if (opts.onFinish) {
+              await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000, meta });
+            }
             controller.close();
             return;
           }
           const idle = now - lastChunkTime;
           if (firstReceived && idle > chunkTimeoutMs) {
             flushStop();
-            if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
+            if (opts.onFinish) {
+              await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000, meta });
+            }
             controller.close();
             return;
           }
@@ -204,7 +281,9 @@ export function createOpenAiStreamFromGrokNdjson(
           const res = await readWithTimeout(reader, perReadTimeout);
           if ("timeout" in res) {
             flushStop();
-            if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
+            if (opts.onFinish) {
+              await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000, meta });
+            }
             controller.close();
             return;
           }
@@ -226,6 +305,7 @@ export function createOpenAiStreamFromGrokNdjson(
             } catch {
               continue;
             }
+            await updateMeta(extractMetaFromLine(data));
 
             firstReceived = true;
             lastChunkTime = Date.now();
@@ -237,7 +317,9 @@ export function createOpenAiStreamFromGrokNdjson(
                 encoder.encode(makeChunk(id, created, currentModel, `Error: ${String(err.message)}`, "stop")),
               );
               controller.enqueue(encoder.encode(makeDone()));
-              if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
+              if (opts.onFinish) {
+                await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000, meta });
+              }
               controller.close();
               return;
             }
@@ -317,7 +399,9 @@ export function createOpenAiStreamFromGrokNdjson(
                     encoder.encode(makeChunk(id, created, currentModel, linesOut.join("\n"), "stop")),
                   );
                   controller.enqueue(encoder.encode(makeDone()));
-                  if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
+                  if (opts.onFinish) {
+                    await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000, meta });
+                  }
                   controller.close();
                   return;
                 }
@@ -337,12 +421,25 @@ export function createOpenAiStreamFromGrokNdjson(
             const currentIsThinking = Boolean(grok.isThinking);
             const messageTag = grok.messageTag;
 
+            if (showThinking && showSearch && currentIsThinking) {
+              const query = extractSearchQuery(token);
+              if (query && !seenSearchQueries.has(query)) {
+                seenSearchQueries.add(query);
+                token = `🔍 搜索: ${query}\n${token}`;
+              }
+            }
+
             if (thinkingFinished && currentIsThinking) continue;
 
             if (grok.toolUsageCardId && grok.webSearchResults?.results && Array.isArray(grok.webSearchResults.results)) {
               if (currentIsThinking) {
-                if (showThinking) {
+                if (showThinking && showSearch) {
                   let appended = "";
+                  const count = grok.webSearchResults.results.length;
+                  if (count !== lastSearchResultCount) {
+                    lastSearchResultCount = count;
+                    appended += `\n🔎 搜索结果: ${count} 条`;
+                  }
                   for (const r of grok.webSearchResults.results) {
                     const title = typeof r.title === "string" ? r.title : "";
                     const url = typeof r.url === "string" ? r.url : "";
@@ -379,7 +476,9 @@ export function createOpenAiStreamFromGrokNdjson(
 
         controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
         controller.enqueue(encoder.encode(makeDone()));
-        if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
+        if (opts.onFinish) {
+          await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000, meta });
+        }
         controller.close();
       } catch (e) {
         finalStatus = 500;
@@ -389,7 +488,9 @@ export function createOpenAiStreamFromGrokNdjson(
           ),
         );
         controller.enqueue(encoder.encode(makeDone()));
-        if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
+        if (opts.onFinish) {
+          await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000, meta });
+        }
         controller.close();
       } finally {
         try {
@@ -404,7 +505,14 @@ export function createOpenAiStreamFromGrokNdjson(
 
 export async function parseOpenAiFromGrokNdjson(
   grokResp: Response,
-  opts: { cookie: string; settings: GrokSettings; global: GlobalSettings; origin: string; requestedModel: string },
+  opts: {
+    cookie: string;
+    settings: GrokSettings;
+    global: GlobalSettings;
+    origin: string;
+    requestedModel: string;
+    onMeta?: (meta: GrokConversationMeta) => Promise<void> | void;
+  },
 ): Promise<Record<string, unknown>> {
   const { global, origin, requestedModel, settings } = opts;
   const text = await grokResp.text();
@@ -412,6 +520,12 @@ export async function parseOpenAiFromGrokNdjson(
 
   let content = "";
   let model = requestedModel;
+  const showThinking = settings.show_thinking !== false;
+  const showSearch = settings.show_search === true;
+  const searchLines: string[] = [];
+  const seenSearchQueries = new Set<string>();
+  let lastSearchResultCount = -1;
+  const meta: GrokConversationMeta = { grokConversationId: "", lastResponseId: "" };
   for (const line of lines) {
     let data: GrokNdjson;
     try {
@@ -419,12 +533,29 @@ export async function parseOpenAiFromGrokNdjson(
     } catch {
       continue;
     }
+    const lineMeta = extractMetaFromLine(data);
+    if (lineMeta.grokConversationId) meta.grokConversationId = lineMeta.grokConversationId;
+    if (lineMeta.lastResponseId) meta.lastResponseId = lineMeta.lastResponseId;
 
     const err = (data as any).error;
     if (err?.message) throw new Error(String(err.message));
 
     const grok = (data as any).result?.response;
     if (!grok) continue;
+
+    if (showThinking && showSearch) {
+      const rawToken = typeof grok.token === "string" ? grok.token : "";
+      const query = rawToken ? extractSearchQuery(rawToken) : "";
+      if (query && !seenSearchQueries.has(query)) {
+        seenSearchQueries.add(query);
+        searchLines.push(`🔍 搜索: ${query}`);
+      }
+      const results = Array.isArray(grok.webSearchResults?.results) ? grok.webSearchResults.results : null;
+      if (results && results.length !== lastSearchResultCount) {
+        lastSearchResultCount = results.length;
+        searchLines.push(`🔎 搜索结果: ${results.length} 条`);
+      }
+    }
 
     const videoResp = grok.streamingVideoGenerationResponse;
     if (videoResp?.videoUrl && typeof videoResp.videoUrl === "string") {
@@ -470,6 +601,11 @@ export async function parseOpenAiFromGrokNdjson(
     // For normal chat replies, the first modelResponse is enough.
     break;
   }
+
+  if (searchLines.length && content) {
+    content = `<think>\n${searchLines.join("\n")}\n</think>\n${content}`;
+  }
+  if (opts.onMeta) await opts.onMeta(meta);
 
   return {
     id: `chatcmpl-${crypto.randomUUID()}`,

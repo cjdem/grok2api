@@ -23,8 +23,13 @@ export interface GrokSettings {
   dynamic_statsig?: boolean;
   filtered_tags?: string;
   show_thinking?: boolean;
+  show_search?: boolean;
   temporary?: boolean;
   video_poster_preview?: boolean;
+  conversation_enable_native?: boolean;
+  conversation_ttl_seconds?: number;
+  conversation_max_per_token?: number;
+  conversation_sticky_token?: boolean;
   stream_first_response_timeout?: number;
   stream_chunk_timeout?: number;
   stream_total_timeout?: number;
@@ -100,8 +105,13 @@ const DEFAULTS: SettingsBundle = {
     dynamic_statsig: true,
     filtered_tags: "xaiartifact,xai:tool_usage_card",
     show_thinking: true,
+    show_search: true,
     temporary: false,
     video_poster_preview: false,
+    conversation_enable_native: true,
+    conversation_ttl_seconds: 72000,
+    conversation_max_per_token: 100,
+    conversation_sticky_token: true,
     stream_first_response_timeout: 30,
     stream_chunk_timeout: 120,
     stream_total_timeout: 600,
@@ -312,4 +322,3 @@ export async function saveSettings(
     ["register", JSON.stringify(nextRegister), now],
   );
 }
-

@@ -15,4 +15,7 @@ export interface Env {
 
   // Batch size for daily cleanup
   KV_CLEANUP_BATCH?: string;
+
+  // Batch size for expired conversation cleanup
+  CONVERSATION_CLEANUP_BATCH?: string;
 }

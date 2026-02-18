@@ -48,6 +48,7 @@ import {
 import { dbAll, dbFirst, dbRun } from "../db";
 import { nowMs } from "../utils/time";
 import { listUsageForDay, localDayString } from "../repo/apiKeyUsage";
+import { cleanupExpiredConversations, getConversationStats } from "../repo/conversations";
 
 function jsonError(message: string, code: string): Record<string, unknown> {
   return { error: message, code };
@@ -261,9 +262,14 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         temporary: Boolean(settings.grok.temporary),
         stream: true,
         thinking: Boolean(settings.grok.show_thinking),
+        show_search: Boolean(settings.grok.show_search),
         dynamic_statsig: Boolean(settings.grok.dynamic_statsig),
         filter_tags: filterTags,
         video_poster_preview: Boolean(settings.grok.video_poster_preview),
+        conversation_enable_native: Boolean(settings.grok.conversation_enable_native),
+        conversation_ttl_seconds: Number(settings.grok.conversation_ttl_seconds ?? 72000),
+        conversation_max_per_token: Number(settings.grok.conversation_max_per_token ?? 100),
+        conversation_sticky_token: Boolean(settings.grok.conversation_sticky_token),
         timeout: Number(settings.grok.stream_total_timeout ?? 600),
         base_proxy_url: String(settings.grok.proxy_url ?? ""),
         asset_proxy_url: String(settings.grok.cache_proxy_url ?? ""),
@@ -334,8 +340,27 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       }
       if (typeof grokCfg.dynamic_statsig === "boolean") grok_config.dynamic_statsig = grokCfg.dynamic_statsig;
       if (typeof grokCfg.thinking === "boolean") grok_config.show_thinking = grokCfg.thinking;
+      if (typeof grokCfg.show_search === "boolean") grok_config.show_search = grokCfg.show_search;
       if (typeof grokCfg.temporary === "boolean") grok_config.temporary = grokCfg.temporary;
       if (typeof grokCfg.video_poster_preview === "boolean") grok_config.video_poster_preview = grokCfg.video_poster_preview;
+      if (typeof grokCfg.conversation_enable_native === "boolean") {
+        grok_config.conversation_enable_native = grokCfg.conversation_enable_native;
+      }
+      if (typeof grokCfg.conversation_sticky_token === "boolean") {
+        grok_config.conversation_sticky_token = grokCfg.conversation_sticky_token;
+      }
+      if (Number.isFinite(Number(grokCfg.conversation_ttl_seconds))) {
+        grok_config.conversation_ttl_seconds = Math.max(
+          60,
+          Math.floor(Number(grokCfg.conversation_ttl_seconds)),
+        );
+      }
+      if (Number.isFinite(Number(grokCfg.conversation_max_per_token))) {
+        grok_config.conversation_max_per_token = Math.max(
+          1,
+          Math.floor(Number(grokCfg.conversation_max_per_token)),
+        );
+      }
       if (Array.isArray(grokCfg.retry_status_codes))
         grok_config.retry_status_codes = grokCfg.retry_status_codes.map((x: any) => Number(x)).filter((n: number) => Number.isFinite(n));
       if (Number.isFinite(Number(grokCfg.timeout))) grok_config.stream_total_timeout = Math.max(1, Math.floor(Number(grokCfg.timeout)));
@@ -868,6 +893,7 @@ adminRoutes.get("/api/v1/admin/metrics", requireAdminAuth, async (c) => {
 
     const stats = await getKvStats(c.env.DB);
     const reqStats = await getRequestStats(c.env.DB);
+    const conversationStats = await getConversationStats(c.env.DB);
     const totalCallsRow = await dbFirst<{ c: number }>(c.env.DB, "SELECT COUNT(1) as c FROM request_logs");
     const totalCalls = totalCallsRow?.c ?? 0;
 
@@ -884,9 +910,37 @@ adminRoutes.get("/api/v1/admin/metrics", requireAdminAuth, async (c) => {
       },
       cache: { local_image: stats.image, local_video: stats.video },
       request_stats: reqStats,
+      conversations: conversationStats,
     });
   } catch (e) {
     return c.json(legacyErr(`Get metrics failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.get("/api/v1/admin/conversations/stats", requireAdminAuth, async (c) => {
+  try {
+    const topN = Math.max(1, Math.min(100, Number(c.req.query("top_n") ?? 20) || 20));
+    const stats = await getConversationStats(c.env.DB, topN);
+    return c.json(legacyOk({ conversations: stats }));
+  } catch (e) {
+    return c.json(
+      legacyErr(`Get conversations stats failed: ${e instanceof Error ? e.message : String(e)}`),
+      500,
+    );
+  }
+});
+
+adminRoutes.post("/api/v1/admin/conversations/cleanup", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as { limit?: unknown };
+    const limit = Math.max(1, Math.min(1000, Number(body.limit ?? 200) || 200));
+    const deleted = await cleanupExpiredConversations(c.env.DB, limit);
+    return c.json(legacyOk({ deleted }));
+  } catch (e) {
+    return c.json(
+      legacyErr(`Cleanup conversations failed: ${e instanceof Error ? e.message : String(e)}`),
+      500,
+    );
   }
 });
 

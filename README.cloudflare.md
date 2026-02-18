@@ -8,8 +8,9 @@
 ## 功能概览
 
 - **D1（SQLite）**：持久化 Tokens / API Keys / 管理员会话 / 配置 / 日志
+- **D1 原生会话上下文**：持久化 `conversation_id -> grok_conversation_id/last_response_id` 映射，支持续聊
 - **KV**：缓存 `/images/*` 的图片/视频资源（从 `assets.grok.com` 代理抓取）
-- **每天 0 点统一清除**：通过 KV `expiration` + Workers Cron 定时清理元数据（`wrangler.toml` 已配置，默认按北京时间 00:00）
+- **每天 0 点统一清除**：通过 Workers Cron 清理 KV 元数据 + 过期会话（`wrangler.toml` 已配置，默认按北京时间 00:00）
 - **前端移动端适配一致生效**：Workers 与 FastAPI/Docker 复用同一套 `/static/*` 资源，包含手机端抽屉导航、表格横向滚动、API Key 居中悬浮新增弹窗等交互
 
 > 原 Python/FastAPI 版本仍保留用于本地/Docker；Cloudflare 部署请按本文件走 Worker 版本。
@@ -73,6 +74,9 @@ npx wrangler d1 migrations apply DB --remote
 - `migrations/0001_init.sql`
 - `migrations/0002_r2_cache.sql`（旧版，已废弃）
 - `migrations/0003_kv_cache.sql`（新版 KV 缓存元数据）
+- `migrations/0004_settings_sections.sql`
+- `migrations/0005_api_key_quotas.sql`
+- `migrations/0006_conversations.sql`（原生会话上下文）
 
 ---
 
@@ -106,6 +110,7 @@ npx wrangler kv namespace create grok2api-cache
 - `crons = ["0 16 * * *"]`：每天 16:00 UTC（= 北京时间 00:00）触发清理
 - `KV_CACHE_MAX_BYTES = "26214400"`：最大缓存对象大小（KV 单值有大小限制，建议 ≤ 25MB）
 - `KV_CLEANUP_BATCH = "200"`：清理批量（删除 KV key + D1 元数据）
+- `CONVERSATION_CLEANUP_BATCH = "200"`：会话清理批量（删除 D1 里过期 conversation 行）
 
 ---
 
@@ -185,8 +190,14 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
    - `dynamic_statsig`（建议开启）
    - 或者关闭动态并填写 `x_statsig_id`
    - （可选）填写 `cf_clearance`（只填值，不要 `cf_clearance=` 前缀）
+   - （可选）`show_search`：在 thinking 输出中展示搜索 query/结果计数（默认开启）
    - （可选）开启 `video_poster_preview`：将返回内容中的 `<video>` 替换为 Poster 预览图（默认关闭）
    - （可选）`image_generation_method`：`legacy`（默认，稳定）或 `imagine_ws_experimental`（实验性新方法，失败自动回退旧方法）
+   - （可选）原生会话参数：
+     - `conversation_enable_native`：启用 Grok 原生会话续聊（默认 `true`）
+     - `conversation_ttl_seconds`：会话保留秒数（默认 `72000`）
+     - `conversation_max_per_token`：每个 scope+token 的会话保留上限（默认 `100`）
+     - `conversation_sticky_token`：优先复用历史 token，失败时自动 clone 续聊（默认 `true`）
 3. **Keys**：创建 API Key，用于调用 `/v1/*`
 
 ---
@@ -194,6 +205,8 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
 ## 8) 接口
 
 - POST /v1/chat/completions (supports stream: true)
+  - 请求可带：`conversation_id`（body）或 `X-Conversation-ID`（header）
+  - 响应会回传：`conversation_id`（json）与 `X-Conversation-ID`（header）
 - GET /v1/models
 - GET /v1/images/method: returns current image-generation mode (legacy or imagine_ws_experimental) for /chat and /admin/chat UI switching
 - POST /v1/images/generations: experimental mode supports size (aspect-ratio mapping) and concurrency (1..3)
@@ -201,6 +214,8 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
 - GET /images/<img_path>: reads from KV cache; on miss fetches assets.grok.com and writes back to KV (daily expiry/cleanup policy)
 - Note: Workers KV single-value size is limited (recommended <= 25MB); most video players use Range requests, which may bypass KV hits
 - Admin APIs: /api/*
+  - `GET /api/v1/admin/conversations/stats`
+  - `POST /api/v1/admin/conversations/cleanup`
 
 ### 8.1) 管理后台 API 兼容语义（与 FastAPI 一致）
 

@@ -21,35 +21,42 @@ export interface OpenAIChatRequestBody {
 
 export const CONVERSATION_API = "https://grok.com/rest/app-chat/conversations/new";
 
+function collectTextAndImages(message: OpenAIChatMessage): { text: string; images: string[] } {
+  const images: string[] = [];
+  const content = message.content ?? "";
+  const parts: string[] = [];
+
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      if (item?.type === "text") {
+        const text = String(item.text ?? "");
+        if (text.trim()) parts.push(text);
+      }
+      if (item?.type === "image_url") {
+        const url = String(item.image_url?.url ?? "").trim();
+        if (url) images.push(url);
+      }
+    }
+  } else {
+    const text = String(content ?? "");
+    if (text.trim()) parts.push(text);
+  }
+
+  return { text: parts.join("\n"), images };
+}
+
 export function extractContent(messages: OpenAIChatMessage[]): { content: string; images: string[] } {
   const images: string[] = [];
   const extracted: Array<{ role: string; text: string }> = [];
 
   for (const msg of messages) {
-    const role = msg.role ?? "user";
-    const content = msg.content ?? "";
-
-    const parts: string[] = [];
-    if (Array.isArray(content)) {
-      for (const item of content) {
-        if (item?.type === "text") {
-          const t = item.text ?? "";
-          if (t.trim()) parts.push(t);
-        }
-        if (item?.type === "image_url") {
-          const url = item.image_url?.url;
-          if (url) images.push(url);
-        }
-      }
-    } else {
-      const t = String(content);
-      if (t.trim()) parts.push(t);
-    }
-
-    if (parts.length) extracted.push({ role, text: parts.join("\n") });
+    const role = String(msg.role ?? "user") || "user";
+    const pair = collectTextAndImages(msg);
+    images.push(...pair.images);
+    if (pair.text) extracted.push({ role, text: pair.text });
   }
 
-  let lastUserIndex: number | null = null;
+  let lastUserIndex = -1;
   for (let i = extracted.length - 1; i >= 0; i--) {
     if (extracted[i]!.role === "user") {
       lastUserIndex = i;
@@ -57,15 +64,23 @@ export function extractContent(messages: OpenAIChatMessage[]): { content: string
     }
   }
 
-  const out: string[] = [];
+  const lines: string[] = [];
   for (let i = 0; i < extracted.length; i++) {
-    const role = extracted[i]!.role || "user";
-    const text = extracted[i]!.text;
-    if (i === lastUserIndex) out.push(text);
-    else out.push(`${role}: ${text}`);
+    const item = extracted[i]!;
+    if (i === lastUserIndex) lines.push(item.text);
+    else lines.push(`${item.role || "user"}: ${item.text}`);
   }
+  return { content: lines.join("\n\n"), images };
+}
 
-  return { content: out.join("\n\n"), images };
+export function extractContinueContent(messages: OpenAIChatMessage[]): { content: string; images: string[] } {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || String(msg.role ?? "") !== "user") continue;
+    const pair = collectTextAndImages(msg);
+    return { content: pair.text, images: pair.images };
+  }
+  return { content: "", images: [] };
 }
 
 export function buildConversationPayload(args: {

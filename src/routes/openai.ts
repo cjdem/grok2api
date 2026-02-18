@@ -4,11 +4,17 @@ import type { Env } from "../env";
 import { requireApiAuth } from "../auth";
 import { getSettings, normalizeCfCookie } from "../settings";
 import { isValidModel, MODEL_CONFIG } from "../grok/models";
-import { extractContent, buildConversationPayload, sendConversationRequest } from "../grok/conversation";
+import {
+  extractContent,
+  extractContinueContent,
+  buildConversationPayload,
+  sendConversationRequest,
+} from "../grok/conversation";
 import { uploadImage } from "../grok/upload";
 import { getDynamicHeaders } from "../grok/headers";
 import { createMediaPost, createPost } from "../grok/create";
 import { createOpenAiStreamFromGrokNdjson, parseOpenAiFromGrokNdjson } from "../grok/processor";
+import { continueConversation, cloneConversationByShare, shareConversation } from "../grok/session";
 import {
   IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL,
   generateImagineWs,
@@ -17,7 +23,13 @@ import {
   sendExperimentalImageEditRequest,
 } from "../grok/imagineExperimental";
 import { addRequestLog } from "../repo/logs";
-import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
+import {
+  applyCooldown,
+  getAvailableTokenByValue,
+  recordTokenFailure,
+  recordTokenSuccess,
+  selectBestToken,
+} from "../repo/tokens";
 import type { ApiAuthInfo } from "../auth";
 import { getApiKeyLimits } from "../repo/apiKeys";
 import { localDayString, tryConsumeDailyUsage, tryConsumeDailyUsageMulti } from "../repo/apiKeyUsage";
@@ -25,6 +37,14 @@ import { nextLocalMidnightExpirationSeconds } from "../kv/cleanup";
 import { nowMs } from "../utils/time";
 import { arrayBufferToBase64 } from "../utils/base64";
 import { upsertCacheRow } from "../repo/cache";
+import {
+  cleanupExpiredConversations,
+  findConversationByHistoryHash,
+  getConversationById,
+  trimConversationsForToken,
+  upsertConversation,
+} from "../repo/conversations";
+import { buildConversationScope, computeHistoryHash } from "../utils/conversation";
 
 function openAiError(message: string, code: string): Record<string, unknown> {
   return { error: { message, type: "invalid_request_error", code } };
@@ -551,6 +571,35 @@ function parseAllowedImageMime(file: File): string | null {
 
 function buildCookie(token: string, cf: string): string {
   return cf ? `sso-rw=${token};sso=${token};${cf}` : `sso-rw=${token};sso=${token}`;
+}
+
+function makeOpenAiConversationId(): string {
+  return `conv-${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+}
+
+function pickConversationId(bodyValue: unknown, headerValue: string | undefined): string {
+  const headerId = String(headerValue ?? "").trim();
+  if (headerId) return headerId;
+  return String(bodyValue ?? "").trim();
+}
+
+function withConversationHeader(resp: Response, conversationId: string): Response {
+  const headers = new Headers(resp.headers);
+  if (conversationId) headers.set("X-Conversation-ID", conversationId);
+  const exposeRaw = headers.get("Access-Control-Expose-Headers") ?? "";
+  const exposeSet = new Set(
+    exposeRaw
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean),
+  );
+  exposeSet.add("X-Conversation-ID");
+  headers.set("Access-Control-Expose-Headers", Array.from(exposeSet).join(", "));
+  return new Response(resp.body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers,
+  });
 }
 
 async function runImageCall(args: {
@@ -1199,6 +1248,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
       model?: string;
       messages?: any[];
       stream?: boolean;
+      conversation_id?: string;
       video_config?: {
         aspect_ratio?: string;
         video_length?: number;
@@ -1215,6 +1265,14 @@ openAiRoutes.post("/chat/completions", async (c) => {
 
     const settingsBundle = await getSettings(c.env);
     const cfg = MODEL_CONFIG[requestedModel]!;
+    const nativeConversationEnabled = settingsBundle.grok.conversation_enable_native !== false;
+    const conversationTtlMs =
+      Math.max(60, Math.floor(Number(settingsBundle.grok.conversation_ttl_seconds ?? 72000))) * 1000;
+    const conversationMaxPerToken = Math.max(
+      1,
+      Math.floor(Number(settingsBundle.grok.conversation_max_per_token ?? 100)),
+    );
+    const stickyToken = settingsBundle.grok.conversation_sticky_token !== false;
 
     const retryCodes = Array.isArray(settingsBundle.grok.retry_status_codes)
       ? settingsBundle.grok.retry_status_codes
@@ -1239,17 +1297,102 @@ openAiRoutes.post("/chat/completions", async (c) => {
     });
     if (!quota.ok) return quota.resp;
 
+    const scope = await buildConversationScope({
+      apiKey: c.get("apiAuth").key,
+      clientIp: ip,
+    });
+    if (nativeConversationEnabled) {
+      c.executionCtx.waitUntil(cleanupExpiredConversations(c.env.DB, 20));
+    }
+    const providedConversationId = pickConversationId(
+      body.conversation_id,
+      c.req.header("X-Conversation-ID"),
+    );
+    const historyLookupHash = nativeConversationEnabled
+      ? await computeHistoryHash(body.messages as any, true)
+      : "";
+    const historyStoreHash = nativeConversationEnabled
+      ? await computeHistoryHash(body.messages as any, false)
+      : "";
+
+    let conversationRow =
+      nativeConversationEnabled && providedConversationId
+        ? await getConversationById(c.env.DB, scope, providedConversationId)
+        : null;
+    if (nativeConversationEnabled && !conversationRow && historyLookupHash) {
+      conversationRow = await findConversationByHistoryHash(c.env.DB, scope, historyLookupHash);
+    }
+    let openaiConversationId = conversationRow?.openai_conversation_id ?? "";
+
+    const ensureConversationId = (): string => {
+      if (!openaiConversationId) openaiConversationId = makeOpenAiConversationId();
+      return openaiConversationId;
+    };
+
     for (let attempt = 0; attempt < maxRetry; attempt++) {
-      const chosen = await selectBestToken(c.env.DB, requestedModel);
+      let chosen =
+        conversationRow && stickyToken
+          ? await getAvailableTokenByValue(c.env.DB, conversationRow.token, requestedModel)
+          : null;
+      if (!chosen) chosen = await selectBestToken(c.env.DB, requestedModel);
       if (!chosen) return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
 
       const jwt = chosen.token;
       const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
       const cookie = cf ? `sso-rw=${jwt};sso=${jwt};${cf}` : `sso-rw=${jwt};sso=${jwt}`;
 
-      const { content, images } = extractContent(body.messages as any);
       const isVideoModel = Boolean(cfg.is_video_model);
-      const imgInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
+      const fullInput = extractContent(body.messages as any);
+      const continueInput = extractContinueContent(body.messages as any);
+      let useContinue = Boolean(nativeConversationEnabled && conversationRow && !isVideoModel);
+      if (useContinue) {
+        const hasContinueInput = Boolean(continueInput.content.trim() || continueInput.images.length);
+        if (!hasContinueInput || !conversationRow?.last_response_id) useContinue = false;
+      }
+
+      let content = fullInput.content;
+      let images = fullInput.images;
+      if (useContinue) {
+        content = continueInput.content;
+        images = continueInput.images;
+      }
+
+      if (useContinue && conversationRow && chosen.token !== conversationRow.token) {
+        if (!conversationRow.share_link_id) {
+          useContinue = false;
+        } else {
+          const cloned = await cloneConversationByShare({
+            shareLinkId: conversationRow.share_link_id,
+            cookie,
+            settings: settingsBundle.grok,
+          });
+          if (!cloned) {
+            useContinue = false;
+          } else {
+            const now = nowMs();
+            await upsertConversation(c.env.DB, {
+              scope,
+              openai_conversation_id: conversationRow.openai_conversation_id,
+              grok_conversation_id: cloned.conversationId,
+              last_response_id: cloned.lastResponseId,
+              share_link_id: conversationRow.share_link_id,
+              token: chosen.token,
+              history_hash: conversationRow.history_hash,
+              created_at: conversationRow.created_at,
+              updated_at: now,
+              expires_at: now + conversationTtlMs,
+            });
+            conversationRow = await getConversationById(
+              c.env.DB,
+              scope,
+              conversationRow.openai_conversation_id,
+            );
+          }
+        }
+      }
+
+      const effectiveImages = useContinue ? images : fullInput.images;
+      const imgInputs = isVideoModel && effectiveImages.length > 1 ? effectiveImages.slice(0, 1) : effectiveImages;
 
       try {
         const uploads = await mapLimit(imgInputs, 5, (u) => uploadImage(u, cookie, settingsBundle.grok));
@@ -1263,7 +1406,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
             postId = post.postId || undefined;
           } else {
             const post = await createMediaPost(
-              { mediaType: "MEDIA_POST_TYPE_VIDEO", prompt: content },
+              { mediaType: "MEDIA_POST_TYPE_VIDEO", prompt: useContinue ? content : fullInput.content },
               cookie,
               settingsBundle.grok,
             );
@@ -1273,7 +1416,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
 
         const { payload, referer } = buildConversationPayload({
           requestModel: requestedModel,
-          content,
+          content: useContinue ? content : fullInput.content,
           imgIds,
           imgUris,
           ...(postId ? { postId } : {}),
@@ -1281,12 +1424,21 @@ openAiRoutes.post("/chat/completions", async (c) => {
           settings: settingsBundle.grok,
         });
 
-        const upstream = await sendConversationRequest({
-          payload,
-          cookie,
-          settings: settingsBundle.grok,
-          ...(referer ? { referer } : {}),
-        });
+        const upstream =
+          useContinue && conversationRow
+            ? await continueConversation({
+                conversationId: conversationRow.grok_conversation_id,
+                payload: { ...payload, parentResponseId: conversationRow.last_response_id },
+                cookie,
+                settings: settingsBundle.grok,
+                ...(referer ? { referer } : {}),
+              })
+            : await sendConversationRequest({
+                payload,
+                cookie,
+                settings: settingsBundle.grok,
+                ...(referer ? { referer } : {}),
+              });
 
         if (!upstream.ok) {
           const txt = await upstream.text().catch(() => "");
@@ -1297,13 +1449,69 @@ openAiRoutes.post("/chat/completions", async (c) => {
           break;
         }
 
+        const persistConversation = async (meta: { grokConversationId: string; lastResponseId: string }) => {
+          if (!nativeConversationEnabled) return;
+          if (!meta.grokConversationId || !meta.lastResponseId) return;
+          const conversationId = ensureConversationId();
+          const now = nowMs();
+          const existing = conversationRow;
+          let shareLinkId = existing?.share_link_id ?? "";
+
+          await upsertConversation(c.env.DB, {
+            scope,
+            openai_conversation_id: conversationId,
+            grok_conversation_id: meta.grokConversationId,
+            last_response_id: meta.lastResponseId,
+            share_link_id: shareLinkId,
+            token: jwt,
+            history_hash: historyStoreHash,
+            created_at: existing?.created_at ?? now,
+            updated_at: now,
+            expires_at: now + conversationTtlMs,
+          });
+
+          await trimConversationsForToken(c.env.DB, scope, jwt, conversationMaxPerToken);
+
+          if (!shareLinkId && !isVideoModel) {
+            const shared = await shareConversation({
+              conversationId: meta.grokConversationId,
+              responseId: meta.lastResponseId,
+              cookie,
+              settings: settingsBundle.grok,
+            }).catch(() => "");
+            if (shared) {
+              shareLinkId = shared;
+              await upsertConversation(c.env.DB, {
+                scope,
+                openai_conversation_id: conversationId,
+                grok_conversation_id: meta.grokConversationId,
+                last_response_id: meta.lastResponseId,
+                share_link_id: shareLinkId,
+                token: jwt,
+                history_hash: historyStoreHash,
+                created_at: existing?.created_at ?? now,
+                updated_at: nowMs(),
+                expires_at: nowMs() + conversationTtlMs,
+              });
+            }
+          }
+
+          const refreshed = await getConversationById(c.env.DB, scope, conversationId);
+          if (refreshed) conversationRow = refreshed;
+        };
+
         if (stream) {
+          const conversationId = ensureConversationId();
           const sse = createOpenAiStreamFromGrokNdjson(upstream, {
             cookie,
             settings: settingsBundle.grok,
             global: settingsBundle.global,
             origin,
-            onFinish: async ({ status, duration }) => {
+            onFinish: async ({ status, duration, meta }) => {
+              if (status === 200) {
+                await recordTokenSuccess(c.env.DB, jwt);
+                await persistConversation(meta);
+              }
               await addRequestLog(c.env.DB, {
                 ip,
                 model: requestedModel,
@@ -1316,25 +1524,37 @@ openAiRoutes.post("/chat/completions", async (c) => {
             },
           });
 
-          return new Response(sse, {
-            status: 200,
-            headers: {
-              "Content-Type": "text/event-stream; charset=utf-8",
-              "Cache-Control": "no-cache",
-              Connection: "keep-alive",
-              "X-Accel-Buffering": "no",
-              "Access-Control-Allow-Origin": "*",
-            },
-          });
+          return withConversationHeader(
+            new Response(sse, {
+              status: 200,
+              headers: {
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                Connection: "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Access-Control-Allow-Origin": "*",
+              },
+            }),
+            conversationId,
+          );
         }
 
+        let parsedMeta = { grokConversationId: "", lastResponseId: "" };
         const json = await parseOpenAiFromGrokNdjson(upstream, {
           cookie,
           settings: settingsBundle.grok,
           global: settingsBundle.global,
           origin,
           requestedModel,
+          onMeta: async (meta) => {
+            parsedMeta = meta;
+          },
         });
+        await recordTokenSuccess(c.env.DB, jwt);
+        await persistConversation(parsedMeta);
+
+        const conversationId = ensureConversationId();
+        (json as any).conversation_id = conversationId;
 
         const duration = (Date.now() - start) / 1000;
         await addRequestLog(c.env.DB, {
@@ -1347,7 +1567,7 @@ openAiRoutes.post("/chat/completions", async (c) => {
           error: "",
         });
 
-        return c.json(json);
+        return withConversationHeader(c.json(json), conversationId);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         lastErr = msg;
@@ -1468,6 +1688,7 @@ openAiRoutes.post("/images/generations", async (c) => {
             aspectRatio,
             concurrency,
             onFinish: async ({ status, duration }) => {
+              if (status === 200) await recordTokenSuccess(c.env.DB, experimentalToken.token);
               await addRequestLog(c.env.DB, {
                 ip,
                 model: requestedModel,
@@ -1544,6 +1765,7 @@ openAiRoutes.post("/images/generations", async (c) => {
         settings: settingsBundle.grok,
         n,
         onFinish: async ({ status, duration }) => {
+          if (status === 200) await recordTokenSuccess(c.env.DB, chosen.token);
           await addRequestLog(c.env.DB, {
             ip,
             model: requestedModel,
@@ -1574,6 +1796,7 @@ openAiRoutes.post("/images/generations", async (c) => {
             concurrency,
           });
           const selected = pickImageResults(urls, n);
+          await recordTokenSuccess(c.env.DB, experimentalToken.token);
           await recordImageLog({
             env: c.env,
             ip,
@@ -1603,7 +1826,7 @@ openAiRoutes.post("/images/generations", async (c) => {
       if (!chosen) throw new Error("No available token");
       const cookie = buildCookie(chosen.token, cf);
       try {
-        return await runImageCall({
+        const urls = await runImageCall({
           requestModel: requestedModel,
           prompt: imageCallPrompt("generation", prompt),
           fileIds: [],
@@ -1612,6 +1835,8 @@ openAiRoutes.post("/images/generations", async (c) => {
           responseFormat,
           baseUrl,
         });
+        await recordTokenSuccess(c.env.DB, chosen.token);
+        return urls;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         await recordTokenFailure(c.env.DB, chosen.token, 500, msg.slice(0, 200));
@@ -1785,6 +2010,7 @@ openAiRoutes.post("/images/edits", async (c) => {
             settings: settingsBundle.grok,
             n,
             onFinish: async ({ status, duration }) => {
+              if (status === 200) await recordTokenSuccess(c.env.DB, chosen.token);
               await addRequestLog(c.env.DB, {
                 ip,
                 model: requestedModel,
@@ -1845,6 +2071,7 @@ openAiRoutes.post("/images/edits", async (c) => {
         settings: settingsBundle.grok,
         n,
         onFinish: async ({ status, duration }) => {
+          if (status === 200) await recordTokenSuccess(c.env.DB, chosen.token);
           await addRequestLog(c.env.DB, {
             ip,
             model: requestedModel,
@@ -1875,6 +2102,7 @@ openAiRoutes.post("/images/edits", async (c) => {
         const urls = dedupeImages(urlsNested.flat().filter(Boolean));
         if (!urls.length) throw new Error("Experimental image edit returned no images");
         const selected = pickImageResults(urls, n);
+        await recordTokenSuccess(c.env.DB, chosen.token);
 
         await recordImageLog({
           env: c.env,
@@ -1909,6 +2137,7 @@ openAiRoutes.post("/images/edits", async (c) => {
     });
     const urls = dedupeImages(urlsNested.flat().filter(Boolean));
     const selected = pickImageResults(urls, n);
+    await recordTokenSuccess(c.env.DB, chosen.token);
 
     await recordImageLog({
       env: c.env,

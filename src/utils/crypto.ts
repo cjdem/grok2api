@@ -8,6 +8,15 @@ function base64UrlEncode(bytes: Uint8Array): string {
   return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+export async function sha256Hex(input: string): Promise<string> {
+  const source = new TextEncoder().encode(String(input ?? ""));
+  const digest = await crypto.subtle.digest("SHA-256", source);
+  const bytes = new Uint8Array(digest);
+  let out = "";
+  for (const byte of bytes) out += byte.toString(16).padStart(2, "0");
+  return out;
+}
+
 export function generateApiKey(): string {
   const bytes = new Uint8Array(24);
   crypto.getRandomValues(bytes);
@@ -24,4 +33,3 @@ export function displayKey(key: string): string {
   if (key.length <= 12) return key;
   return `${key.slice(0, 6)}...${key.slice(-4)}`;
 }
-

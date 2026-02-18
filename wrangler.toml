@@ -47,6 +47,9 @@ KV_CACHE_MAX_BYTES = "26214400"
 # Batch size for the daily cleanup job (deleting KV keys + D1 rows).
 KV_CLEANUP_BATCH = "200"
 
+# Batch size for expired conversation rows cleanup.
+CONVERSATION_CLEANUP_BATCH = "200"
+
 [triggers]
 # Every day at 00:00 (Asia/Shanghai => 16:00 UTC)
 crons = ["0 16 * * *"]

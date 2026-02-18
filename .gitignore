@@ -44,10 +44,12 @@ env/
 # Node / Cloudflare Workers
 node_modules/
 .wrangler/
+.npm/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 wrangler.ci.toml
+*.tsbuildinfo
 
 # Logs
 logs/
