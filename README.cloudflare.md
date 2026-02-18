@@ -12,6 +12,9 @@
 - **KV**：缓存 `/images/*` 的图片/视频资源（从 `assets.grok.com` 代理抓取）
 - **每天 0 点统一清除**：通过 Workers Cron 清理 KV 元数据 + 过期会话（`wrangler.toml` 已配置，默认按北京时间 00:00）
 - **前端移动端适配一致生效**：Workers 与 FastAPI/Docker 复用同一套 `/static/*` 资源，包含手机端抽屉导航、表格横向滚动、API Key 居中悬浮新增弹窗等交互
+- **`grok-4.20-beta` 兼容优化**：修复流式/非流式场景下的空回与早停问题
+- **工具卡片结构化输出**：`xai:tool_usage_card` 解析为 `[rolloutId][Type] 内容`，并支持换行输出
+- **Token 账户设置刷新（Workers）**：支持一键执行 `accept-tos -> set-birth -> nsfw`
 
 > 原 Python/FastAPI 版本仍保留用于本地/Docker；Cloudflare 部署请按本文件走 Worker 版本。
 
@@ -201,6 +204,9 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
      - `conversation_ttl_seconds`：会话保留秒数（默认 `72000`）
      - `conversation_max_per_token`：每个 scope+token 的会话保留上限（默认 `100`）
      - `conversation_sticky_token`：优先复用历史 token，失败时自动 clone 续聊（默认 `true`）
+   - （可选）Token 账户刷新参数：
+     - `nsfw_refresh_concurrency`：账户设置刷新并发（默认 `10`）
+     - `nsfw_refresh_retries`：账户设置刷新重试次数（默认 `3`）
 3. **Keys**：创建 API Key，用于调用 `/v1/*`
 
 ---
@@ -219,6 +225,7 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
 - Admin APIs: /api/*
   - `GET /api/v1/admin/conversations/stats`
   - `POST /api/v1/admin/conversations/cleanup`
+  - `POST /api/v1/admin/tokens/nsfw/refresh`
 
 ### 8.1) 管理后台 API 兼容语义（与 FastAPI 一致）
 

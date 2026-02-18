@@ -423,7 +423,7 @@ curl http://localhost:8000/v1/images/edits \
 - 新增配置：
   - `token.nsfw_refresh_concurrency`（默认 `10`）
   - `token.nsfw_refresh_retries`（默认 `3`）
-- 说明：该功能仅在 `python-fastapi`（本地/Docker）开放；`cloudflare-workers` 侧不展示该按钮。
+- 说明：该功能在 `python-fastapi`（本地/Docker）与 `cloudflare-workers` 均可用；Workers 侧对应接口为 `POST /api/v1/admin/tokens/nsfw/refresh`。
 
 ## Star History
 

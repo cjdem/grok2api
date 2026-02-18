@@ -35,7 +35,8 @@ import {
   updateTokenLimits,
 } from "../repo/tokens";
 import { generateImagineWs, resolveAspectRatio } from "../grok/imagineExperimental";
-import { checkRateLimits } from "../grok/rateLimits";
+import { checkRateLimits, normalizeRateLimitResponse } from "../grok/rateLimits";
+import { runAccountSettingsFlow } from "../grok/accountSettings";
 import { addRequestLog, clearRequestLogs, getRequestLogs, getRequestStats } from "../repo/logs";
 import { getRefreshProgress, setRefreshProgress } from "../repo/refreshProgress";
 import {
@@ -135,6 +136,31 @@ function parseWsMessageData(data: unknown): Record<string, unknown> | null {
 
 function wsSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runTasksSettledWithLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  if (!items.length) return [];
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(Math.floor(limit || 1), items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const idx = nextIndex++;
+      if (idx >= items.length) break;
+      try {
+        const value = await fn(items[idx] as T);
+        results[idx] = { status: "fulfilled", value };
+      } catch (reason) {
+        results[idx] = { status: "rejected", reason };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function parseImagineWsFailureStatus(message: string): number {
@@ -284,6 +310,8 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         auto_refresh: Boolean(settings.token.auto_refresh),
         refresh_interval_hours: Number(settings.token.refresh_interval_hours ?? 8),
         fail_threshold: Number(settings.token.fail_threshold ?? 5),
+        nsfw_refresh_concurrency: Number(settings.token.nsfw_refresh_concurrency ?? 10),
+        nsfw_refresh_retries: Number(settings.token.nsfw_refresh_retries ?? 3),
         save_delay_ms: Number(settings.token.save_delay_ms ?? 500),
         reload_interval_sec: Number(settings.token.reload_interval_sec ?? 30),
       },
@@ -377,6 +405,18 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
         token_config.refresh_interval_hours = Math.max(1, Number(tokenCfg.refresh_interval_hours));
       if (Number.isFinite(Number(tokenCfg.fail_threshold)))
         token_config.fail_threshold = Math.max(1, Math.floor(Number(tokenCfg.fail_threshold)));
+      if (Number.isFinite(Number(tokenCfg.nsfw_refresh_concurrency))) {
+        token_config.nsfw_refresh_concurrency = Math.max(
+          1,
+          Math.floor(Number(tokenCfg.nsfw_refresh_concurrency)),
+        );
+      }
+      if (Number.isFinite(Number(tokenCfg.nsfw_refresh_retries))) {
+        token_config.nsfw_refresh_retries = Math.max(
+          0,
+          Math.floor(Number(tokenCfg.nsfw_refresh_retries)),
+        );
+      }
       if (Number.isFinite(Number(tokenCfg.save_delay_ms)))
         token_config.save_delay_ms = Math.max(0, Math.floor(Number(tokenCfg.save_delay_ms)));
       if (Number.isFinite(Number(tokenCfg.reload_interval_sec)))
@@ -757,19 +797,22 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
       try {
         const cookie = cf ? `sso-rw=${t};sso=${t};${cf}` : `sso-rw=${t};sso=${t}`;
         const tokenType = tokenTypeByToken.get(t) ?? "sso";
-        const r = await checkRateLimits(cookie, settings.grok, "grok-4-fast");
-        const remaining = (r as any)?.remainingTokens;
+        const chatRaw = await checkRateLimits(cookie, settings.grok, "grok-4-fast");
+        const chat = normalizeRateLimitResponse(chatRaw, "grok-4-fast");
+        const remaining = typeof chat.remaining === "number" ? Math.max(0, Math.floor(chat.remaining)) : null;
         let heavyRemaining: number | null = null;
         if (tokenType === "ssoSuper") {
-          const rh = await checkRateLimits(cookie, settings.grok, "grok-4-heavy");
-          const hv = (rh as any)?.remainingTokens;
-          if (typeof hv === "number") heavyRemaining = hv;
+          const heavyRaw = await checkRateLimits(cookie, settings.grok, "grok-4-heavy");
+          const heavy = normalizeRateLimitResponse(heavyRaw, "grok-4-heavy");
+          if (typeof heavy.remaining === "number") {
+            heavyRemaining = Math.max(0, Math.floor(heavy.remaining));
+          }
         }
-        if (typeof remaining === "number") {
-          await updateTokenLimits(c.env.DB, t, {
-            remaining_queries: remaining,
-            ...(heavyRemaining !== null ? { heavy_remaining_queries: heavyRemaining } : {}),
-          });
+        const updates: { remaining_queries?: number; heavy_remaining_queries?: number } = {};
+        if (remaining !== null) updates.remaining_queries = remaining;
+        if (heavyRemaining !== null) updates.heavy_remaining_queries = heavyRemaining;
+        if (Object.keys(updates).length) {
+          await updateTokenLimits(c.env.DB, t, updates);
           results[`sso=${t}`] = true;
         } else {
           results[`sso=${t}`] = false;
@@ -783,6 +826,187 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
     return c.json(legacyOk({ results }));
   } catch (e) {
     return c.json(legacyErr(`Refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      all?: unknown;
+      tokens?: unknown;
+      token?: unknown;
+      concurrency?: unknown;
+      retries?: unknown;
+    };
+
+    const rows = await listTokens(c.env.DB);
+    const rowByToken = new Map(rows.map((r) => [r.token, r]));
+
+    const requestedTokens: string[] = [];
+    if (body && typeof body === "object") {
+      if (body.all === true) {
+        for (const row of rows) {
+          if (row.status !== "expired") requestedTokens.push(row.token);
+        }
+      } else {
+        if (typeof body.token === "string") requestedTokens.push(body.token);
+        if (Array.isArray(body.tokens)) {
+          requestedTokens.push(...body.tokens.filter((x): x is string => typeof x === "string"));
+        }
+      }
+    }
+
+    const unique = [...new Set(requestedTokens.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+    if (!unique.length) return c.json(legacyErr("No tokens provided"), 400);
+
+    const settings = await getSettings(c.env);
+    const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
+    const concurrency = Math.max(
+      1,
+      Math.min(
+        50,
+        Math.floor(
+          Number(
+            body?.concurrency ??
+              settings.token.nsfw_refresh_concurrency ??
+              10,
+          ) || 10,
+        ),
+      ),
+    );
+    const retries = Math.max(
+      0,
+      Math.min(
+        10,
+        Math.floor(
+          Number(
+            body?.retries ??
+              settings.token.nsfw_refresh_retries ??
+              3,
+          ) || 3,
+        ),
+      ),
+    );
+    const maxAttempts = retries + 1;
+
+    const grpcToHttp = (code: number | undefined): number | null => {
+      if (!Number.isFinite(code)) return null;
+      if (code === 16) return 401;
+      if (code === 7) return 403;
+      if (code === 8) return 429;
+      if (code === 4) return 504;
+      if (code === 14) return 503;
+      return null;
+    };
+
+    const settled = await runTasksSettledWithLimit(unique, concurrency, async (token) => {
+      const row = rowByToken.get(token);
+      if (!row) {
+        return {
+          token,
+          ok: false,
+          attempts: 0,
+          step: "token",
+          error: "token not found",
+          invalidated: false,
+        };
+      }
+
+      let lastStep = "unknown";
+      let lastError = "unknown";
+      let lastStatus: number | null = null;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const cookie = cf ? `sso-rw=${token};sso=${token};${cf}` : `sso-rw=${token};sso=${token}`;
+        const result = await runAccountSettingsFlow({ cookie, settings: settings.grok });
+        if (result.ok) {
+          const info = tokenRowToInfo(row);
+          const tags = new Set(info.tags);
+          tags.add("nsfw");
+          await updateTokenTags(c.env.DB, token, row.token_type, [...tags]);
+          return { token, ok: true, attempts: attempt };
+        }
+
+        const failed = result.steps.find((s) => !s.ok) ?? result.steps[result.steps.length - 1];
+        lastStep = failed?.step ?? "unknown";
+        lastError = failed?.error ?? "unknown";
+        const status = typeof failed?.status === "number" ? failed.status : grpcToHttp(failed?.grpc_status);
+        lastStatus = typeof status === "number" ? status : null;
+      }
+
+      const reason = `account_settings_refresh_failed step=${lastStep} attempts=${maxAttempts} error=${lastError}`.slice(
+        0,
+        200,
+      );
+      const failureStatus = lastStatus ?? 500;
+      await recordTokenFailure(c.env.DB, token, failureStatus, reason);
+      await applyCooldown(c.env.DB, token, failureStatus);
+      await dbRun(c.env.DB, "UPDATE tokens SET status = 'expired' WHERE token = ?", [token]);
+
+      return {
+        token,
+        ok: false,
+        attempts: maxAttempts,
+        step: lastStep,
+        error: lastError,
+        invalidated: true,
+      };
+    });
+
+    const failed: Array<Record<string, unknown>> = [];
+    let success = 0;
+    let invalidated = 0;
+
+    for (let i = 0; i < settled.length; i += 1) {
+      const item = settled[i]!;
+      if (item.status === "fulfilled") {
+        const value = item.value as {
+          token: string;
+          ok: boolean;
+          attempts: number;
+          step?: string;
+          error?: string;
+          invalidated?: boolean;
+        };
+        if (value.ok) {
+          success += 1;
+        } else {
+          if (value.invalidated) invalidated += 1;
+          failed.push({
+            token: value.token,
+            step: value.step ?? "unknown",
+            error: value.error ?? "unknown",
+            attempts: value.attempts,
+            invalidated: Boolean(value.invalidated),
+          });
+        }
+        continue;
+      }
+
+      const token = unique[i] ?? "";
+      const reason = item.reason;
+      failed.push({
+        token,
+        step: "exception",
+        error: reason instanceof Error ? reason.message : String(reason),
+        attempts: maxAttempts,
+        invalidated: false,
+      });
+    }
+
+    return c.json(
+      legacyOk({
+        summary: {
+          total: unique.length,
+          success,
+          failed: failed.length,
+          invalidated,
+        },
+        failed,
+      }),
+    );
+  } catch (e) {
+    return c.json(legacyErr(`NSFW refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
   }
 });
 

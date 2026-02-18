@@ -1,4 +1,5 @@
 import type { GrokSettings, GlobalSettings } from "../settings";
+import { ToolUsageCardStreamParser, replaceToolUsageCardsInText } from "./toolUsageCard";
 
 type GrokNdjson = Record<string, unknown>;
 type GrokObj = Record<string, unknown>;
@@ -20,19 +21,6 @@ function asObj(v: unknown): GrokObj | null {
 
 function asStr(v: unknown): string {
   return typeof v === "string" ? v.trim() : "";
-}
-
-function extractSearchQuery(raw: string): string {
-  const tool = raw.match(/<xai:tool_name>([\w-]+)<\/xai:tool_name>/i);
-  if (!tool || tool[1]?.toLowerCase() !== "web_search") return "";
-  const args = raw.match(/<!\[CDATA\[(.+?)\]\]>/is);
-  if (!args || !args[1]) return "";
-  try {
-    const parsed = JSON.parse(args[1]) as Record<string, unknown>;
-    return asStr(parsed.query);
-  } catch {
-    return "";
-  }
 }
 
 function extractMetaFromLine(data: GrokNdjson): Partial<GrokConversationMeta> {
@@ -214,17 +202,68 @@ export function createOpenAiStreamFromGrokNdjson(
 
       let currentModel = "grok-4-mini-thinking-tahoe";
       let isImage = false;
-      let isThinking = false;
-      let thinkingFinished = false;
+      let thinkTagOpen = false;
+      let lastIsThinking = false;
       let videoProgressStarted = false;
       let lastVideoProgress = -1;
-      let lastSearchResultCount = -1;
-      const seenSearchQueries = new Set<string>();
+      let lastToolRolloutId = "";
+      const toolUsageParser = new ToolUsageCardStreamParser();
+      const passthroughFilteredTags = filteredTags.filter((tag) => tag.toLowerCase() !== "xai:tool_usage_card");
+      const shouldEmitToolLines = showThinking && showSearch;
       const meta: GrokConversationMeta = { grokConversationId: "", lastResponseId: "" };
 
       let buffer = "";
 
+      const emitTextDelta = (args: { text: string; lines: string[]; isThinking: boolean; messageTag?: unknown }) => {
+        const pieces: string[] = [];
+
+        if (showThinking) {
+          if (args.isThinking && !thinkTagOpen) {
+            pieces.push("<think>\n");
+            thinkTagOpen = true;
+          } else if (!args.isThinking && thinkTagOpen) {
+            pieces.push("\n</think>\n");
+            thinkTagOpen = false;
+          }
+        }
+
+        if (!args.isThinking || showThinking) {
+          for (const line of args.lines) pieces.push(`${line}\n`);
+          if (args.text) {
+            const body = args.messageTag === "header" ? `\n\n${args.text}\n\n` : args.text;
+            pieces.push(body);
+          }
+        }
+
+        const payload = pieces.join("");
+        if (payload) controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, payload)));
+        lastIsThinking = args.isThinking;
+      };
+
+      const flushToolBuffer = (isThinkingFrame: boolean) => {
+        const flushed = toolUsageParser.flush({
+          emitLines: shouldEmitToolLines,
+          fallbackRolloutId: lastToolRolloutId,
+          emitIncompleteAsText: true,
+        });
+        if (!flushed.text && !flushed.lines.length) return;
+        emitTextDelta({ text: flushed.text, lines: flushed.lines, isThinking: isThinkingFrame });
+      };
+
+      const closeThinkWrappers = () => {
+        if (showThinking && thinkTagOpen) {
+          controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "\n</think>\n")));
+          thinkTagOpen = false;
+        }
+        if (showThinking && videoProgressStarted) {
+          controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "</think>\n")));
+          videoProgressStarted = false;
+        }
+      };
+
       const flushStop = () => {
+        flushToolBuffer(lastIsThinking);
+        closeThinkWrappers();
         controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
         controller.enqueue(encoder.encode(makeDone()));
       };
@@ -313,6 +352,8 @@ export function createOpenAiStreamFromGrokNdjson(
             const err = (data as any).error;
             if (err?.message) {
               finalStatus = 500;
+              flushToolBuffer(lastIsThinking);
+              closeThinkWrappers();
               controller.enqueue(
                 encoder.encode(makeChunk(id, created, currentModel, `Error: ${String(err.message)}`, "stop")),
               );
@@ -348,6 +389,7 @@ export function createOpenAiStreamFromGrokNdjson(
                     msg = `视频已生成${progress}%\n`;
                   } else {
                     msg = `视频已生成${progress}%</think>\n`;
+                    videoProgressStarted = false;
                   }
                   controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, msg)));
                 }
@@ -398,6 +440,7 @@ export function createOpenAiStreamFromGrokNdjson(
                   controller.enqueue(
                     encoder.encode(makeChunk(id, created, currentModel, linesOut.join("\n"), "stop")),
                   );
+                  closeThinkWrappers();
                   controller.enqueue(encoder.encode(makeDone()));
                   if (opts.onFinish) {
                     await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000, meta });
@@ -412,76 +455,39 @@ export function createOpenAiStreamFromGrokNdjson(
             }
 
             // Text chat stream
-            if (Array.isArray(rawToken)) continue;
-            if (typeof rawToken !== "string" || !rawToken) continue;
-            let token = rawToken;
-
-            if (filteredTags.some((t) => token.includes(t))) continue;
-
             const currentIsThinking = Boolean(grok.isThinking);
             const messageTag = grok.messageTag;
+            const rolloutId = asStr(grok.rolloutId);
+            const toolCardId = asStr(grok.toolUsageCardId);
+            if (rolloutId) lastToolRolloutId = rolloutId;
+            else if (toolCardId) lastToolRolloutId = toolCardId;
 
-            if (showThinking && showSearch && currentIsThinking) {
-              const query = extractSearchQuery(token);
-              if (query && !seenSearchQueries.has(query)) {
-                seenSearchQueries.add(query);
-                token = `🔍 搜索: ${query}\n${token}`;
-              }
-            }
+            let token = typeof rawToken === "string" ? rawToken : "";
+            if (token && passthroughFilteredTags.some((tag) => token.includes(tag))) token = "";
 
-            if (thinkingFinished && currentIsThinking) continue;
+            const parsed = toolUsageParser.consume(token, {
+              emitLines: shouldEmitToolLines,
+              fallbackRolloutId: lastToolRolloutId,
+            });
 
-            if (grok.toolUsageCardId && grok.webSearchResults?.results && Array.isArray(grok.webSearchResults.results)) {
-              if (currentIsThinking) {
-                if (showThinking && showSearch) {
-                  let appended = "";
-                  const count = grok.webSearchResults.results.length;
-                  if (count !== lastSearchResultCount) {
-                    lastSearchResultCount = count;
-                    appended += `\n🔎 搜索结果: ${count} 条`;
-                  }
-                  for (const r of grok.webSearchResults.results) {
-                    const title = typeof r.title === "string" ? r.title : "";
-                    const url = typeof r.url === "string" ? r.url : "";
-                    const preview = typeof r.preview === "string" ? r.preview.replace(/\n/g, "") : "";
-                    appended += `\n- [${title}](${url} \"${preview}\")`;
-                  }
-                  token += `${appended}\n`;
-                } else {
-                  continue;
-                }
-              } else {
-                continue;
-              }
-            }
-
-            let content = token;
-            if (messageTag === "header") content = `\n\n${token}\n\n`;
-
-            let shouldSkip = false;
-            if (!isThinking && currentIsThinking) {
-              if (showThinking) content = `<think>\n${content}`;
-              else shouldSkip = true;
-            } else if (isThinking && !currentIsThinking) {
-              if (showThinking) content = `\n</think>\n${content}`;
-              thinkingFinished = true;
-            } else if (currentIsThinking && !showThinking) {
-              shouldSkip = true;
-            }
-
-            if (!shouldSkip) controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, content)));
-            isThinking = currentIsThinking;
+            emitTextDelta({
+              text: parsed.text,
+              lines: parsed.lines,
+              isThinking: currentIsThinking,
+              messageTag,
+            });
           }
         }
 
-        controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
-        controller.enqueue(encoder.encode(makeDone()));
+        flushStop();
         if (opts.onFinish) {
           await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000, meta });
         }
         controller.close();
       } catch (e) {
         finalStatus = 500;
+        flushToolBuffer(lastIsThinking);
+        closeThinkWrappers();
         controller.enqueue(
           encoder.encode(
             makeChunk(id, created, currentModel, `处理错误: ${e instanceof Error ? e.message : String(e)}`, "error"),
@@ -518,13 +524,14 @@ export async function parseOpenAiFromGrokNdjson(
   const text = await grokResp.text();
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
 
-  let content = "";
   let model = requestedModel;
   const showThinking = settings.show_thinking !== false;
   const showSearch = settings.show_search === true;
-  const searchLines: string[] = [];
-  const seenSearchQueries = new Set<string>();
-  let lastSearchResultCount = -1;
+  const shouldEmitToolLines = showThinking && showSearch;
+  let latestMessage = "";
+  let latestToolLines: string[] = [];
+  let mergedContent: string | null = null;
+  let lastToolRolloutId = "";
   const meta: GrokConversationMeta = { grokConversationId: "", lastResponseId: "" };
   for (const line of lines) {
     let data: GrokNdjson;
@@ -542,20 +549,10 @@ export async function parseOpenAiFromGrokNdjson(
 
     const grok = (data as any).result?.response;
     if (!grok) continue;
-
-    if (showThinking && showSearch) {
-      const rawToken = typeof grok.token === "string" ? grok.token : "";
-      const query = rawToken ? extractSearchQuery(rawToken) : "";
-      if (query && !seenSearchQueries.has(query)) {
-        seenSearchQueries.add(query);
-        searchLines.push(`🔍 搜索: ${query}`);
-      }
-      const results = Array.isArray(grok.webSearchResults?.results) ? grok.webSearchResults.results : null;
-      if (results && results.length !== lastSearchResultCount) {
-        lastSearchResultCount = results.length;
-        searchLines.push(`🔎 搜索结果: ${results.length} 条`);
-      }
-    }
+    const rolloutId = asStr(grok.rolloutId);
+    const toolCardId = asStr(grok.toolUsageCardId);
+    if (rolloutId) lastToolRolloutId = rolloutId;
+    else if (toolCardId) lastToolRolloutId = toolCardId;
 
     const videoResp = grok.streamingVideoGenerationResponse;
     if (videoResp?.videoUrl && typeof videoResp.videoUrl === "string") {
@@ -568,13 +565,13 @@ export async function parseOpenAiFromGrokNdjson(
         poster = toImgProxyUrl(global, origin, thumbPath);
       }
 
-      content = buildVideoHtml({
+      mergedContent = buildVideoHtml({
         videoUrl: src,
         posterPreview: settings.video_poster_preview === true,
         ...(poster ? { posterUrl: poster } : {}),
       });
       model = requestedModel;
-      break;
+      continue;
     }
 
     const modelResp = grok.modelResponse;
@@ -582,28 +579,39 @@ export async function parseOpenAiFromGrokNdjson(
     if (typeof modelResp.error === "string" && modelResp.error) throw new Error(modelResp.error);
 
     if (typeof modelResp.model === "string" && modelResp.model) model = modelResp.model;
-    if (typeof modelResp.message === "string") content = modelResp.message;
+    if (typeof modelResp.message === "string") {
+      const parsed = replaceToolUsageCardsInText(modelResp.message, {
+        emitLines: shouldEmitToolLines,
+        fallbackRolloutId: lastToolRolloutId,
+      });
+      if (modelResp.message.length > 0 || parsed.lines.length > 0) {
+        latestMessage = parsed.text;
+        latestToolLines = parsed.lines;
+      }
+    }
 
     const rawUrls = modelResp.generatedImageUrls;
     const urls = normalizeGeneratedAssetUrls(rawUrls);
     if (urls.length) {
+      const imageLines: string[] = [];
       for (const u of urls) {
         const imgPath = encodeAssetPath(u);
         const imgUrl = toImgProxyUrl(global, origin, imgPath);
-        content += `\n![Generated Image](${imgUrl})`;
+        imageLines.push(`![Generated Image](${imgUrl})`);
       }
-      break;
+      const prefix = latestMessage ? `${latestMessage}\n` : "";
+      mergedContent = `${prefix}${imageLines.join("\n")}`;
+      continue;
     }
 
     // If upstream emits placeholder/empty generatedImageUrls in intermediate frames, keep scanning.
     if (Array.isArray(rawUrls)) continue;
-
-    // For normal chat replies, the first modelResponse is enough.
-    break;
   }
 
-  if (searchLines.length && content) {
-    content = `<think>\n${searchLines.join("\n")}\n</think>\n${content}`;
+  let content = mergedContent ?? latestMessage;
+  if (latestToolLines.length) {
+    const toolBlock = latestToolLines.join("\n");
+    content = content ? `<think>\n${toolBlock}\n</think>\n${content}` : `<think>\n${toolBlock}\n</think>`;
   }
   if (opts.onMeta) await opts.onMeta(meta);
 

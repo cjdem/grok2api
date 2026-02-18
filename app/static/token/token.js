@@ -218,13 +218,12 @@ async function detectWorkersRuntime() {
 }
 
 async function applyRuntimeUiFlags() {
-  // Default hide first; show back for local/docker after detection.
+  // Workers 版本也支持 NSFW 刷新，只隐藏自动注册入口。
   setAutoRegisterUiEnabled(false);
-  setNsfwRefreshUiEnabled(false);
+  setNsfwRefreshUiEnabled(true);
   isWorkersRuntime = await detectWorkersRuntime();
   if (!isWorkersRuntime) {
     setAutoRegisterUiEnabled(true);
-    setNsfwRefreshUiEnabled(true);
   }
 }
 
