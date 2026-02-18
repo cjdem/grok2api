@@ -153,6 +153,9 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
 - `workflow_dispatch`：可手动选择 `cloudflare/docker/both`
 - `v*` tag：用于 Docker 构建发布链路
 
+模型更新说明：
+- 模型定义来自代码（`src/grok/models.ts`）；例如新增 `grok-4.20-beta` 后，push 到 `main` 即可通过该工作流自动发布到 Cloudflare Worker，无需额外改 CI 配置。
+
 你需要在 GitHub 仓库里配置 Secrets（Settings → Secrets and variables → Actions）：
 
 - `CLOUDFLARE_API_TOKEN`
