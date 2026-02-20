@@ -528,8 +528,13 @@ export async function parseOpenAiFromGrokNdjson(
   const showThinking = settings.show_thinking !== false;
   const showSearch = settings.show_search === true;
   const shouldEmitToolLines = showThinking && showSearch;
+  const filteredTags = (settings.filtered_tags ?? "")
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
   let latestMessage = "";
   let latestToolLines: string[] = [];
+  let tokenParts: string[] = [];
   let mergedContent: string | null = null;
   let lastToolRolloutId = "";
   const meta: GrokConversationMeta = { grokConversationId: "", lastResponseId: "" };
@@ -549,6 +554,9 @@ export async function parseOpenAiFromGrokNdjson(
 
     const grok = (data as any).result?.response;
     if (!grok) continue;
+
+    const rawToken = typeof grok.token === "string" ? grok.token : "";
+    if (rawToken && !filteredTags.some((t) => rawToken.includes(t))) tokenParts.push(rawToken);
     const rolloutId = asStr(grok.rolloutId);
     const toolCardId = asStr(grok.toolUsageCardId);
     if (rolloutId) lastToolRolloutId = rolloutId;
@@ -609,6 +617,7 @@ export async function parseOpenAiFromGrokNdjson(
   }
 
   let content = mergedContent ?? latestMessage;
+  if (!content && tokenParts.length) content = tokenParts.join("");
   if (latestToolLines.length) {
     const toolBlock = latestToolLines.join("\n");
     content = content ? `<think>\n${toolBlock}\n</think>\n${content}` : `<think>\n${toolBlock}\n</think>`;

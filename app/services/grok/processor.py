@@ -10,6 +10,7 @@ from typing import Any, AsyncGenerator, Optional, AsyncIterable, List
 
 from app.core.config import get_config
 from app.core.logger import logger
+from app.core.exceptions import UpstreamException
 from app.services.grok.assets import DownloadService
 
 
@@ -107,6 +108,47 @@ class BaseProcessor:
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
 
 
+def _safe_text(line: Any) -> str:
+    """将上游行内容转为可读文本（仅用于日志/错误提示，避免抛异常）。"""
+    if line is None:
+        return ""
+    if isinstance(line, bytes):
+        return line.decode("utf-8", errors="replace")
+    if isinstance(line, str):
+        return line
+    return str(line)
+
+
+def _try_load_ndjson(line: Any) -> Any | None:
+    """尽最大努力解析上游 NDJSON 行，失败返回 None。"""
+    if not line:
+        return None
+    try:
+        # orjson.loads 在不同版本/入参类型上行为可能不同，统一转 bytes 以提升兼容性。
+        if isinstance(line, (bytes, bytearray, memoryview)):
+            return orjson.loads(line)
+        if isinstance(line, str):
+            return orjson.loads(line.encode("utf-8"))
+        return orjson.loads(str(line).encode("utf-8"))
+    except orjson.JSONDecodeError:
+        return None
+    except Exception:
+        return None
+
+
+def _extract_upstream_error(data: Any) -> str | None:
+    """从上游帧中提取错误信息。"""
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if not isinstance(err, dict):
+        return None
+    msg = err.get("message")
+    if isinstance(msg, str) and msg.strip():
+        return msg.strip()
+    return None
+
+
 class StreamProcessor(BaseProcessor):
     """流式响应处理器"""
     
@@ -126,14 +168,29 @@ class StreamProcessor(BaseProcessor):
     
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """处理流式响应"""
+        emitted_content = False
+        first_nonempty = ""
         try:
             async for line in response:
                 if not line:
                     continue
+                if not first_nonempty:
+                    first_nonempty = _safe_text(line)[:200]
                 try:
-                    data = orjson.loads(line)
-                except orjson.JSONDecodeError:
+                    data = _try_load_ndjson(line)
+                    if data is None:
+                        continue
+                except Exception:
                     continue
+
+                if upstream_msg := _extract_upstream_error(data):
+                    # 尽量以“可见内容”的方式返回，避免客户端看到空回。
+                    if not self.role_sent:
+                        yield self._sse(role="assistant")
+                        self.role_sent = True
+                    yield self._sse(f"上游错误: {upstream_msg}\n")
+                    emitted_content = True
+                    break
                 
                 resp = data.get("result", {}).get("response", {})
                 
@@ -157,15 +214,24 @@ class StreamProcessor(BaseProcessor):
                         idx = img.get('imageIndex', 0) + 1
                         progress = img.get('progress', 0)
                         yield self._sse(f"正在生成第{idx}张图片中，当前进度{progress}%\n")
+                        emitted_content = True
                     continue
                 
                 # modelResponse
                 if mr := resp.get("modelResponse"):
+                    msg = mr.get("message")
                     if self.think_opened and self.show_think:
-                        if msg := mr.get("message"):
+                        if isinstance(msg, str) and msg:
                             yield self._sse(msg + "\n")
+                            emitted_content = True
                         yield self._sse("</think>\n")
                         self.think_opened = False
+                    else:
+                        # 若上游不再逐 token 推送，退化为在 modelResponse.message 中一次性返回；
+                        # 仅在此前没有输出任何内容时启用，避免重复输出。
+                        if not emitted_content and isinstance(msg, str) and msg:
+                            yield self._sse(msg)
+                            emitted_content = True
                     
                     # 处理生成的图片
                     for url in mr.get("generatedImageUrls", []):
@@ -177,12 +243,15 @@ class StreamProcessor(BaseProcessor):
                             base64_data = await dl_service.to_base64(url, self.token, "image")
                             if base64_data:
                                 yield self._sse(f"![{img_id}]({base64_data})\n")
+                                emitted_content = True
                             else:
                                 final_url = await self.process_url(url, "image")
                                 yield self._sse(f"![{img_id}]({final_url})\n")
+                                emitted_content = True
                         else:
                             final_url = await self.process_url(url, "image")
                             yield self._sse(f"![{img_id}]({final_url})\n")
+                            emitted_content = True
                     
                     if (meta := mr.get("metadata", {})).get("llm_info", {}).get("modelHash"):
                         self.fingerprint = meta["llm_info"]["modelHash"]
@@ -192,7 +261,19 @@ class StreamProcessor(BaseProcessor):
                 if (token := resp.get("token")) is not None:
                     if token and not (self.filter_tags and any(t in token for t in self.filter_tags)):
                         yield self._sse(token)
-                        
+                        emitted_content = True
+                         
+            # 上游正常结束但没有任何可见内容时，避免客户端收到“空回”。
+            if not emitted_content:
+                logger.warning(
+                    "Upstream stream ended without any visible content.",
+                    extra={"model": self.model, "first_line": first_nonempty},
+                )
+                if not self.role_sent:
+                    yield self._sse(role="assistant")
+                    self.role_sent = True
+                yield self._sse("上游未返回可用内容，请检查 token/cf_clearance/proxy 或上游格式是否变更。\n")
+
             if self.think_opened:
                 yield self._sse("</think>\n")
             yield self._sse(finish="stop")
@@ -216,27 +297,52 @@ class CollectProcessor(BaseProcessor):
         response_id = ""
         fingerprint = ""
         content = ""
+        token_parts: list[str] = []
+        image_lines: list[str] = []
+        first_nonempty = ""
+        filter_tags = get_config("grok.filter_tags", [])
         
         try:
             async for line in response:
                 if not line:
                     continue
+                if not first_nonempty:
+                    first_nonempty = _safe_text(line)[:200]
                 try:
-                    data = orjson.loads(line)
-                except orjson.JSONDecodeError:
+                    data = _try_load_ndjson(line)
+                    if data is None:
+                        continue
+                except Exception:
                     continue
+
+                if upstream_msg := _extract_upstream_error(data):
+                    raise UpstreamException(
+                        message=f"Upstream error: {upstream_msg}",
+                        details={"message": upstream_msg},
+                    )
                 
                 resp = data.get("result", {}).get("response", {})
+                if not isinstance(resp, dict) or not resp:
+                    continue
+
+                if not response_id and (rid := resp.get("responseId")):
+                    response_id = str(rid)
                 
                 if (llm := resp.get("llmInfo")) and not fingerprint:
                     fingerprint = llm.get("modelHash", "")
+
+                if (token := resp.get("token")) is not None:
+                    if isinstance(token, str) and token and not (filter_tags and any(t in token for t in filter_tags)):
+                        token_parts.append(token)
                 
                 if mr := resp.get("modelResponse"):
-                    response_id = mr.get("responseId", "")
-                    content = mr.get("message", "")
+                    if not response_id:
+                        response_id = mr.get("responseId", "") or response_id
+                    msg = mr.get("message", "")
+                    if isinstance(msg, str):
+                        content = msg
                     
                     if urls := mr.get("generatedImageUrls"):
-                        content += "\n"
                         for url in urls:
                             parts = url.split("/")
                             img_id = parts[-2] if len(parts) >= 2 else "image"
@@ -245,21 +351,40 @@ class CollectProcessor(BaseProcessor):
                                 dl_service = self._get_dl()
                                 base64_data = await dl_service.to_base64(url, self.token, "image")
                                 if base64_data:
-                                    content += f"![{img_id}]({base64_data})\n"
+                                    image_lines.append(f"![{img_id}]({base64_data})")
                                 else:
                                     final_url = await self.process_url(url, "image")
-                                    content += f"![{img_id}]({final_url})\n"
+                                    image_lines.append(f"![{img_id}]({final_url})")
                             else:
                                 final_url = await self.process_url(url, "image")
-                                content += f"![{img_id}]({final_url})\n"
+                                image_lines.append(f"![{img_id}]({final_url})")
                     
                     if (meta := mr.get("metadata", {})).get("llm_info", {}).get("modelHash"):
                         fingerprint = meta["llm_info"]["modelHash"]
                             
+        except UpstreamException:
+            raise
         except Exception as e:
             logger.error(f"Collect processing error: {e}", extra={"model": self.model})
         finally:
             await self.close()
+
+        if not content and token_parts:
+            content = "".join(token_parts)
+        if image_lines:
+            prefix = content + "\n" if content else ""
+            content = prefix + "\n".join(image_lines)
+
+        if not content:
+            logger.warning(
+                "Upstream returned empty completion content.",
+                extra={"model": self.model, "first_line": first_nonempty},
+            )
+            detail = {"first_line": first_nonempty} if first_nonempty else None
+            raise UpstreamException("Upstream returned empty response", details=detail)
+
+        if not response_id:
+            response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         
         return {
             "id": response_id,
